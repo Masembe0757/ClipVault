@@ -734,3 +734,9 @@
     urlInput.focus();
   })();
 })();
+
+// Footer copyright year
+{
+  const yearEl = document.getElementById("copyYear");
+  if (yearEl) yearEl.textContent = String(new Date().getFullYear());
+}

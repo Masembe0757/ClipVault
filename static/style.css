@@ -48,6 +48,7 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
+  display: flex; flex-direction: column;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
   transition: background 0.3s ease, color 0.3s ease;
@@ -141,7 +142,7 @@ input { font: inherit; color: inherit; }
 
 /* ================= Layout ================= */
 .container {
-  position: relative; z-index: 1;
+  position: relative; z-index: 1; width: 100%; flex: 1 0 auto;
   max-width: 980px; margin: 0 auto; padding: 0 clamp(16px, 4vw, 32px) 40px;
 }
 
@@ -330,8 +331,20 @@ img.broken { opacity: 0; }
 .empty-art svg { width: 26px; height: 26px; }
 
 .footer {
-  position: relative; z-index: 1; display: flex; justify-content: center; gap: 8px 20px; flex-wrap: wrap;
-  padding: 24px 16px 34px; font-size: 12.5px; color: var(--text-3);
+  position: relative; z-index: 1; margin-top: auto;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px; color: var(--text-3);
+}
+.footer-inner {
+  max-width: 980px; margin: 0 auto; padding: 20px clamp(16px, 4vw, 32px) 28px;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px 24px; flex-wrap: wrap;
+}
+.footer p { margin: 0; }
+.footer-note { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.footer-copy { color: var(--text-2); font-weight: 500; white-space: nowrap; }
+@media (max-width: 760px) {
+  .footer-inner { flex-direction: column; text-align: center; }
+  .footer-note { justify-content: center; }
 }
 
 /* ================= Drawer ================= */
