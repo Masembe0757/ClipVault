@@ -1,0 +1,10 @@
+# Clipvault dependencies. The app installs these itself on first run (see bootstrap.py);
+# this file is for manual installs: python -m pip install -r requirements.txt
+# Keep in sync with REQUIREMENTS in bootstrap.py.
+flask>=3.0,<4
+# No upper bound: YouTube changes often and yt-dlp must stay current.
+yt-dlp[default]>=2025.11.12
+# Only needed when ffmpeg is not already installed on the system.
+imageio-ffmpeg>=0.5,<1
+# JavaScript runtime YouTube requires (not needed if Node.js is installed).
+deno>=2,<3

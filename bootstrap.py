@@ -13,6 +13,16 @@ import time
 
 PIP_RETRIES = 3
 
+# Version ranges Clipvault is tested with. Keep requirements.txt in sync.
+# Each entry: (pip spec, distribution name, minimum version, first unsupported major).
+# yt-dlp has no upper bound on purpose: YouTube changes often, so it must stay current.
+REQUIREMENTS = {
+    "flask": ("flask>=3.0,<4", "flask", (3, 0), 4),
+    "yt-dlp": ("yt-dlp[default]>=2025.11.12", "yt-dlp", (2025, 11, 12), None),
+    "imageio-ffmpeg": ("imageio-ffmpeg>=0.5,<1", "imageio-ffmpeg", (0, 5), 1),
+    "deno": ("deno>=2,<3", "deno", (2,), 3),
+}
+
 
 def log(msg):
     print(f"[clipvault] {msg}", flush=True)
@@ -75,6 +85,39 @@ def _has(module):
         return False
 
 
+def _version_tuple(text):
+    parts = []
+    for piece in str(text).split("."):
+        digits = ""
+        for ch in piece:  # leading digits only: "0rc1" -> 0
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+        if len(digits) < len(piece):  # pre-release suffix ends the numeric part
+            break
+    return tuple(parts)
+
+
+def _satisfies(name):
+    """True when the installed distribution is inside the supported range."""
+    _spec, dist, minimum, max_major = REQUIREMENTS[name]
+    try:
+        from importlib import metadata
+        installed = _version_tuple(metadata.version(dist))
+    except Exception:
+        return False
+    if installed < minimum:
+        return False
+    return max_major is None or (installed and installed[0] < max_major)
+
+
+def spec(name):
+    return REQUIREMENTS[name][0]
+
+
 def _engine_is_stale(max_age_days=21):
     """yt-dlp versions are dates (e.g. 2026.10.26). Treat old ones as stale."""
     try:
@@ -112,25 +155,25 @@ def ensure_all():
     _add_scripts_dirs_to_path()
     ensure_pip()
 
-    if not _has("flask"):
+    if not _has("flask") or not _satisfies("flask"):
         log("Installing Flask (web interface)...")
-        pip_install("flask")
+        pip_install(spec("flask"))
 
-    if not _has("yt_dlp"):
+    if not _has("yt_dlp") or not _satisfies("yt-dlp"):
         log("Installing yt-dlp (download engine)...")
-        pip_install("yt-dlp[default]")
+        pip_install(spec("yt-dlp"), upgrade=True)
     elif _engine_is_stale():
         # YouTube changes often; an old yt-dlp is the #1 cause of failed downloads.
         log("Updating yt-dlp to the latest version...")
-        pip_install("yt-dlp[default]", upgrade=True, required=False)
+        pip_install(spec("yt-dlp"), upgrade=True, required=False)
 
     if not find_ffmpeg():
         log("Installing ffmpeg (needed for HD video and MP3)...")
-        pip_install("imageio-ffmpeg")
+        pip_install(spec("imageio-ffmpeg"))
 
     # YouTube needs a JavaScript runtime for reliable extraction.
     if not find_deno() and not shutil.which("node"):
         log("Installing Deno (JavaScript runtime for YouTube)... this is a one-time ~40 MB download")
-        pip_install("deno", required=False)
+        pip_install(spec("deno"), required=False)
 
     return {"ffmpeg": find_ffmpeg(), "deno": find_deno(), "node": shutil.which("node")}
