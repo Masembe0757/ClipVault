@@ -319,6 +319,21 @@ img.broken { opacity: 0; }
 .job-stats { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-size: 12.5px; color: var(--text-2); }
 .job-stats .nums { font-family: var(--mono); color: var(--text-3); }
 .job-error { margin-top: 8px; font-size: 12.5px; color: var(--err); line-height: 1.45; word-break: break-word; }
+.job-notice { margin-top: 8px; font-size: 12.5px; color: var(--warn); line-height: 1.45; }
+
+/* Subtitle picker */
+.sub-pick { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px;
+  padding: 10px 12px; border-radius: 12px; background: var(--surface); border: 1px solid var(--border); }
+.sub-pick label { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; color: var(--text-2); }
+.sub-pick select {
+  min-width: 0; max-width: 60%; height: 34px; padding: 0 30px 0 12px; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--border); background-color: var(--surface-solid); color: var(--text);
+  font: inherit; font-size: 13.5px; outline: none; appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238a8a9c' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 9px center; background-size: 15px;
+}
+.sub-pick select:focus { border-color: var(--accent); }
+.hint.sub-hint { margin: -10px 2px 16px; }
 .job-actions { display: flex; gap: 6px; }
 .job-actions .icon-btn { width: 36px; height: 36px; }
 .job-actions .icon-btn.danger:hover { color: var(--err); }

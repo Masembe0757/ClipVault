@@ -28,8 +28,12 @@ TOOLS = bootstrap.ensure_all()
 import logging  # noqa: E402
 
 from flask import Flask, jsonify, request, send_from_directory  # noqa: E402
+from werkzeug.exceptions import HTTPException  # noqa: E402
 
 import downloader  # noqa: E402
+
+downloader.setup_logging()
+log = downloader.log
 
 APP_NAME = "Clipvault"
 APP_VERSION = "1.0.0"
@@ -59,6 +63,14 @@ def fail(message, code=400):
 
 def body():
     return request.get_json(silent=True) or {}
+
+
+@app.errorhandler(Exception)
+def unexpected_error(e):
+    if isinstance(e, HTTPException):
+        return e
+    log.exception("Unhandled error on %s %s", request.method, request.path)
+    return fail("Something went wrong. Details were written to data/clipvault.log.", 500)
 
 
 # ---------------------------------------------------------------- pages
@@ -91,6 +103,7 @@ def info():
     except ValueError as e:
         return fail(str(e))
     except Exception as e:
+        log.warning("Fetching info failed for %s: %s", url, e)
         return fail(str(e), 502)
 
 
@@ -109,7 +122,11 @@ def download():
             quality = int(quality)
         except (TypeError, ValueError):
             return fail("Unknown video quality.")
-    jobs = engine.add_jobs(items, kind, quality)
+    try:
+        subtitles = downloader.parse_subtitles(b.get("subtitles")) if kind == "video" else None
+    except ValueError as e:
+        return fail(str(e))
+    jobs = engine.add_jobs(items, kind, quality, subtitles, b.get("subtitles_label"))
     if not jobs:
         return fail("No valid YouTube links to download.")
     return ok(jobs)
@@ -160,6 +177,7 @@ def settings():
     try:
         return ok(engine.update_settings(body()))
     except Exception as e:
+        log.warning("Saving settings failed: %s", e)
         return fail(f"Couldn't save settings: {e}")
 
 

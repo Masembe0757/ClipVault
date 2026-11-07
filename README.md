@@ -10,6 +10,10 @@ Download videos in up to 4K, or save music as high-quality MP3.
   - You see every available quality with its estimated size: 4K, 2K, 1080p, 720p and so on.
   - Videos are saved as `.mp4`.
 - **Music mode.** Save audio as MP3 (320 or 192 kbps) or as the original M4A, with the cover art and tags embedded.
+- **Subtitles.**
+  - Pick a subtitle language before downloading a video. Uploaded subtitles are listed first, then YouTube's auto-generated captions.
+  - Subtitles are embedded in the `.mp4`, and also saved as a separate `.srt` file unless you turn that off in Settings.
+  - If a video has no subtitles in that language, it is still downloaded, with a note on the download.
 - **Playlists.**
   - Paste a playlist link to see every video in it.
   - Pick the ones you want and download them all in one go.
@@ -38,6 +42,8 @@ You need **Python 3.9 or newer**. Everything else is installed automatically on 
 | Deno | The JavaScript runtime YouTube now requires |
 
 The first run downloads roughly 100 MB of tools. After that, the app starts in seconds.
+
+To install the dependencies yourself instead, run `python -m pip install -r requirements.txt`.
 
 ## How to run
 
@@ -78,6 +84,7 @@ By default, files are saved to **`Downloads/Clipvault`** in your user folder. To
 | "Confirm you're not a bot" | YouTube is rate-limiting your network. Wait a few minutes, or try another network |
 | Video won't play on TV/phone | Turn on **Maximum compatibility** in Settings (it's on by default) |
 | Port already in use | Clipvault picks the next free port automatically, or use `--port` |
+| Something else went wrong | Warnings and errors are written to `data/clipvault.log` |
 
 ## Project layout
 
@@ -86,8 +93,9 @@ clipvault/
 ├── app.py          # entry point: web server + API
 ├── downloader.py   # download engine: queue, progress, retries, history
 ├── bootstrap.py    # installs and updates dependencies
+├── requirements.txt # supported dependency versions (for manual installs)
 ├── static/         # the interface (HTML, CSS, JS)
-├── data/           # settings.json and history.json (created at runtime)
+├── data/           # settings, history and clipvault.log (created at runtime)
 ├── run.bat         # Windows launcher
 └── run.sh          # macOS / Linux / Git Bash launcher
 ```

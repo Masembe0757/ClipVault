@@ -5,6 +5,8 @@ cancellation, retries with backoff, and persistent history.
 
 import glob
 import json
+import logging
+import logging.handlers
 import os
 import random
 import re
@@ -24,13 +26,37 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+LOG_FILE = os.path.join(DATA_DIR, "clipvault.log")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+log = logging.getLogger("clipvault")
+
+
+def setup_logging():
+    """Write warnings and errors to data/clipvault.log (rotated at ~1 MB, 3 backups)."""
+    if any(getattr(h, "_clipvault", False) for h in log.handlers):
+        return LOG_FILE
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    handler._clipvault = True
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    return LOG_FILE
 
 MAX_ATTEMPTS = 5
 BASE_DELAY = 3  # seconds, doubled each attempt
 
 YOUTUBE_RE = re.compile(
     r"^(https?://)?([\w-]+\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)/", re.I)
+
+# Subtitle choice sent by the UI:
+#   "<lang>"       uploaded subtitles in that language (e.g. "en", "pt-BR")
+#   "auto:<lang>"  YouTube's automatic captions with that key (e.g. "en-orig")
+#   "any:<lang>"   uploaded subtitles, falling back to automatic captions (playlists)
+#   "orig"         automatic captions in the video's spoken language (playlists)
+SUBS_RE = re.compile(r"^(?:(auto|any):)?([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2})$")
 
 # Errors that retrying cannot fix
 PERMANENT_ERRORS = (
@@ -59,6 +85,7 @@ DEFAULT_SETTINGS = {
     "prefer_h264": True,        # plays on every device/player
     "embed_thumbnail": True,    # cover art in mp3/mp4
     "add_metadata": True,       # title/artist tags
+    "keep_subtitle_file": True, # save subtitles as a .srt next to the video too
     "theme": "dark",
 }
 
@@ -71,15 +98,62 @@ def _read_json(path, default):
         return default
 
 
+_WRITE_LOCK = threading.Lock()
+
+
 def _write_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """Atomic write. Serialized so jobs finishing at the same moment don't race on
+    the temp file, and retried because Windows refuses to replace a file that
+    another program (antivirus, indexer) has open for a moment."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with _WRITE_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 def is_youtube_url(url):
     return bool(YOUTUBE_RE.match((url or "").strip()))
+
+
+def parse_subtitles(choice):
+    """Validate a subtitle choice from the UI. Returns the normalized choice,
+    None for "no subtitles", or raises ValueError."""
+    choice = (choice or "").strip()
+    if not choice or choice == "none":
+        return None
+    if choice == "orig" or SUBS_RE.match(choice):
+        return choice
+    raise ValueError("Unknown subtitle language.")
+
+
+def subtitle_opts(choice):
+    """yt-dlp options for a validated subtitle choice."""
+    if choice == "orig":
+        return {"writeautomaticsub": True, "subtitleslangs": [r".*-orig"]}
+    mode, lang = SUBS_RE.match(choice).groups()
+    lang_re = re.escape(lang)
+    if mode == "auto":
+        return {"writeautomaticsub": True, "subtitleslangs": [lang_re]}
+    if mode == "any":
+        # Uploaded subtitles win; automatic captions only fill missing languages.
+        return {"writesubtitles": True, "writeautomaticsub": True,
+                "subtitleslangs": [lang_re, lang_re + "-orig"]}
+    return {"writesubtitles": True, "subtitleslangs": [lang_re]}
 
 
 class Cancelled(Exception):
@@ -113,9 +187,10 @@ class Job:
     FIELDS = ("id", "url", "video_id", "title", "uploader", "thumbnail", "duration",
               "kind", "quality", "quality_label", "status", "stage", "progress",
               "downloaded_bytes", "total_bytes", "speed", "eta", "attempt", "max_attempts",
-              "error", "filepath", "created_at", "finished_at", "retry_at")
+              "error", "filepath", "created_at", "finished_at", "retry_at",
+              "subtitles", "subtitles_label", "notice")
 
-    def __init__(self, url, kind, quality, meta=None):
+    def __init__(self, url, kind, quality, meta=None, subtitles=None, subtitles_label=None):
         meta = meta or {}
         self.id = uuid.uuid4().hex[:12]
         self.url = url
@@ -141,6 +216,9 @@ class Job:
         self.created_at = time.time()
         self.finished_at = None
         self.retry_at = None
+        self.subtitles = subtitles if kind == "video" else None
+        self.subtitles_label = (str(subtitles_label)[:40] or None) if self.subtitles and subtitles_label else None
+        self.notice = None          # non-fatal problem shown on a finished job
         self.log = []
         self.cancel_event = threading.Event()
         # internal progress bookkeeping
@@ -190,6 +268,7 @@ class Engine:
     def __init__(self, tools):
         self.tools = tools  # paths found by bootstrap: ffmpeg, deno, node
         self.lock = threading.RLock()
+        self.wake = threading.Condition(self.lock)  # signalled when the queue may need attention
         self.jobs = {}
         self.order = []
         self.settings = dict(DEFAULT_SETTINGS)
@@ -213,10 +292,11 @@ class Engine:
             if k == "output_dir":
                 v = os.path.abspath(os.path.expanduser(str(v).strip()))
                 os.makedirs(v, exist_ok=True)
-            if k in ("prefer_h264", "embed_thumbnail", "add_metadata"):
+            if k in ("prefer_h264", "embed_thumbnail", "add_metadata", "keep_subtitle_file"):
                 v = bool(v)
             self.settings[k] = v
         _write_json(SETTINGS_FILE, self.settings)
+        self._wake_scheduler()  # max_concurrent may have changed
         return self.get_settings()
 
     def _load_history(self):
@@ -226,6 +306,7 @@ class Engine:
                 self.jobs[job.id] = job
                 self.order.append(job.id)
             except Exception:
+                log.exception("Skipping unreadable history entry")
                 continue
 
     def save_history(self):
@@ -234,7 +315,7 @@ class Engine:
         try:
             _write_json(HISTORY_FILE, data)
         except Exception:
-            pass
+            log.exception("Could not save download history")
 
     # ---------------- yt-dlp options ----------------
     def _base_opts(self, job=None):
@@ -269,7 +350,7 @@ class Engine:
             opts["ffmpeg_location"] = self.tools["ffmpeg"]
         return opts
 
-    def _download_opts(self, job, outdir, embed_thumbnail):
+    def _download_opts(self, job, outdir, embed_thumbnail, subtitles=None):
         s = self.settings
         opts = self._base_opts(job)
         name = "%(title).150B [%(id)s].%(ext)s"
@@ -306,6 +387,14 @@ class Engine:
             sort.append("ext:mp4:m4a")
             opts["format_sort"] = sort
             opts["merge_output_format"] = "mp4"
+            if subtitles:
+                opts.update(subtitle_opts(subtitles))
+                opts["subtitlesformat"] = "srt/vtt/best"
+                # Convert to .srt before download, then embed into the mp4.
+                # Same order as yt-dlp's own command line.
+                pps.append({"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"})
+                pps.append({"key": "FFmpegEmbedSubtitle",
+                            "already_have_subtitle": bool(s.get("keep_subtitle_file"))})
         if s.get("add_metadata"):
             pps.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
         if embed_thumbnail:
@@ -357,7 +446,11 @@ class Engine:
             return {"type": "playlist", "url": url, "title": info.get("title") or "Playlist",
                     "uploader": info.get("uploader") or info.get("channel"),
                     "count": len(entries), "entries": entries,
-                    "thumbnail": entries[0]["thumbnail"] if entries else None}
+                    "thumbnail": entries[0]["thumbnail"] if entries else None,
+                    "subtitles": [
+                        {"value": "any:en", "label": "English", "auto": False},
+                        {"value": "orig", "label": "Original language (auto-generated)", "auto": True},
+                    ]}
 
         formats = info.get("formats") or []
         audio_size = 0
@@ -393,6 +486,7 @@ class Engine:
             "upload_date": info.get("upload_date"), "thumbnail": thumb,
             "is_live": bool(info.get("is_live")),
             "qualities": qualities,
+            "subtitles": _subtitle_choices(info),
             "audio": [
                 {"value": "mp3-320", "label": "MP3 · 320 kbps", "size": int(duration * 40000) or None},
                 {"value": "mp3-192", "label": "MP3 · 192 kbps", "size": int(duration * 24000) or None},
@@ -401,7 +495,7 @@ class Engine:
         }
 
     # ---------------- queue ----------------
-    def add_jobs(self, items, kind, quality):
+    def add_jobs(self, items, kind, quality, subtitles=None, subtitles_label=None):
         created = []
         with self.lock:
             for it in items:
@@ -411,10 +505,11 @@ class Engine:
                 q = quality
                 if kind == "video" and q != "best":
                     q = int(q)
-                job = Job(url, kind, q, it)
+                job = Job(url, kind, q, it, subtitles, subtitles_label)
                 self.jobs[job.id] = job
                 self.order.append(job.id)
                 created.append(job.to_dict())
+            self._wake_scheduler()
         self.save_history()
         return created
 
@@ -435,10 +530,12 @@ class Engine:
         job = self.jobs.get(job_id)
         if not job or job.status in Job.LIVE:
             return False
-        job.cancel_event = threading.Event()
-        job.status, job.stage = "queued", "Waiting in queue"
-        job.error, job.attempt, job.progress, job.finished_at = None, 0, 0.0, None
-        job.speed = job.eta = None
+        with self.lock:
+            job.cancel_event = threading.Event()
+            job.status, job.stage = "queued", "Waiting in queue"
+            job.error, job.attempt, job.progress, job.finished_at = None, 0, 0.0, None
+            job.speed = job.eta = job.notice = None
+            self._wake_scheduler()
         self.save_history()
         return True
 
@@ -463,26 +560,42 @@ class Engine:
             self.order = keep
         self.save_history()
 
+    def _wake_scheduler(self):
+        with self.wake:
+            self.wake.notify_all()
+
     def _scheduler(self):
+        """Start queued jobs while there are free slots. Sleeps until something
+        changes (job added, finished, retried, or settings saved) instead of polling.
+        The timeout is only a safety net."""
         while True:
-            try:
-                with self.lock:
+            with self.wake:
+                try:
                     active = sum(1 for j in self.jobs.values()
                                  if j.status in ("starting", "downloading", "processing", "waiting"))
                     limit = int(self.settings.get("max_concurrent", 2))
-                    queued = [self.jobs[i] for i in self.order if self.jobs[i].status == "queued"]
-                    for job in queued[:max(0, limit - active)]:
-                        job.status, job.stage = "starting", "Starting..."
-                        threading.Thread(target=self._run_job, args=(job,), daemon=True).start()
-            except Exception:
-                pass
-            time.sleep(0.4)
+                    free = max(0, limit - active)
+                    if free:
+                        for i in self.order:
+                            job = self.jobs[i]
+                            if job.status != "queued":
+                                continue
+                            job.status, job.stage = "starting", "Starting..."
+                            threading.Thread(target=self._run_job, args=(job,), daemon=True,
+                                             name=f"job-{job.id}").start()
+                            free -= 1
+                            if not free:
+                                break
+                except Exception:
+                    log.exception("Scheduler error")
+                self.wake.wait(timeout=30)
 
     # ---------------- running a job ----------------
     def _run_job(self, job):
         outdir = self.settings["output_dir"]
         os.makedirs(outdir, exist_ok=True)
         embed_thumb = bool(self.settings.get("embed_thumbnail"))
+        subtitles = job.subtitles
         last_error = None
 
         while job.attempt < job.max_attempts:
@@ -494,7 +607,7 @@ class Engine:
             try:
                 if job.cancel_event.is_set():
                     raise Cancelled()
-                self._download_once(job, outdir, embed_thumb)
+                self._download_once(job, outdir, embed_thumb, subtitles)
                 job.progress = 100.0
                 self._finish(job, "done", "Completed")
                 return
@@ -510,11 +623,17 @@ class Engine:
                 last_error = e
                 msg = str(e).lower()
                 job.add_log(_clean_error(e))
+                log.warning("Job %s attempt %d/%d failed: %s", job.id, job.attempt,
+                            job.max_attempts, _clean_error(e))
                 if _is_permanent(msg):
                     break
                 # A thumbnail problem shouldn't cost the whole download
                 if "thumbnail" in msg and embed_thumb:
                     embed_thumb = False
+                # Neither should a subtitle problem: retry without them and say so
+                if "subtitle" in msg and subtitles:
+                    subtitles = None
+                    job.notice = "Subtitles couldn't be downloaded, so the video was saved without them."
                 if any(h in msg for h in OUTDATED_HINTS) and self.update_state["status"] == "idle":
                     threading.Thread(target=self.update_engine, daemon=True).start()
 
@@ -530,10 +649,11 @@ class Engine:
                     return
 
         job.error = _clean_error(last_error)
+        log.error("Job %s failed: %s (%s)", job.id, job.error, job.url)
         self._finish(job, "error", "Failed")
 
-    def _download_once(self, job, outdir, embed_thumb):
-        opts = self._download_opts(job, outdir, embed_thumb)
+    def _download_once(self, job, outdir, embed_thumb, subtitles=None):
+        opts = self._download_opts(job, outdir, embed_thumb, subtitles)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(job.url, download=False)
             if job.cancel_event.is_set():
@@ -551,6 +671,8 @@ class Engine:
             job._stream_bytes_done = 0
             job.total_bytes = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in req)
             job._prefix = os.path.splitext(ydl.prepare_filename(info))[0]
+            if subtitles and not info.get("requested_subtitles"):
+                job.notice = "No subtitles in that language for this video, so it was saved without them."
             job.status, job.stage = "downloading", "Downloading..."
             result = ydl.process_ie_result(info, download=True)
         try:
@@ -612,6 +734,8 @@ class Engine:
             "Metadata": "Writing tags",
             "FFmpegMetadata": "Writing tags",
             "EmbedThumbnail": "Embedding cover art",
+            "FFmpegEmbedSubtitle": "Embedding subtitles",
+            "EmbedSubtitle": "Embedding subtitles",
         }
         pp = d.get("postprocessor") or ""
         if pp in names or pp.startswith("FFmpeg"):
@@ -637,6 +761,7 @@ class Engine:
         job.finished_at = time.time()
         if status == "done":
             job.error = None
+        self._wake_scheduler()  # a slot may have opened up
         self.save_history()
 
     # ---------------- engine updates ----------------
@@ -644,7 +769,7 @@ class Engine:
         if self.update_state["status"] == "running":
             return self.update_state
         self.update_state = {"status": "running", "installed": None, "message": "Updating yt-dlp..."}
-        ok = bootstrap.pip_install("yt-dlp[default]", upgrade=True, required=False)
+        ok = bootstrap.pip_install(bootstrap.spec("yt-dlp"), upgrade=True, required=False)
         try:
             new = metadata.version("yt-dlp")
         except Exception:
@@ -662,6 +787,40 @@ class Engine:
 
 
 # --------------------------------------------------------------------------- #
+def _subtitle_choices(info):
+    """Subtitle options for one video: uploaded subtitles first (the video's own
+    language, then English, then A-Z), then automatic captions in the spoken
+    language when there are no uploaded ones in that language."""
+    def name_of(formats, code):
+        for f in formats or []:
+            if f.get("name"):
+                return f["name"]
+        return code
+
+    spoken = (info.get("language") or "").split("-")[0].lower()
+    manual = []
+    for code, formats in (info.get("subtitles") or {}).items():
+        if code == "live_chat" or not SUBS_RE.match(code):
+            continue
+        manual.append({"value": code, "label": name_of(formats, code), "auto": False})
+
+    def rank(c):
+        base = c["value"].split("-")[0].lower()
+        return (base != spoken if spoken else True, base != "en", c["label"].lower())
+    manual.sort(key=rank)
+
+    have = {c["value"].split("-")[0].lower() for c in manual}
+    auto = []
+    for code, formats in (info.get("automatic_captions") or {}).items():
+        if not code.endswith("-orig") or not SUBS_RE.match(code):
+            continue
+        if code[:-5].split("-")[0].lower() in have:
+            continue
+        label = name_of(formats, code).replace(" (Original)", "")
+        auto.append({"value": f"auto:{code}", "label": f"{label} (auto-generated)", "auto": True})
+    return manual + auto
+
+
 def _is_permanent(msg):
     msg = (msg or "").lower()
     return any(p in msg for p in PERMANENT_ERRORS)

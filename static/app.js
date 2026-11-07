@@ -24,6 +24,7 @@
     eye: '<svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
     cal: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>',
     list: '<svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
+    cc: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10.5 10.2a2.2 2.2 0 1 0 0 3.6M17 10.2a2.2 2.2 0 1 0 0 3.6"/></svg>',
   };
 
   const fmtBytes = (n) => {
@@ -106,6 +107,7 @@
     info: null,
     kind: "video",
     quality: null,
+    subs: "",
     selected: new Set(),
     jobs: [],
     filter: "all",
@@ -154,6 +156,7 @@
     try {
       const { data } = await api("/api/info", { body: { url } });
       state.info = data;
+      state.subs = "";
       if (data.type === "playlist") renderPlaylist(data);
       else renderVideo(data);
     } catch (e) {
@@ -239,7 +242,34 @@
       </button>`).join("")}</div>`;
   }
 
+  function subtitlePicker(info) {
+    if (state.kind !== "video" || !(info.subtitles || []).length) return "";
+    const opts = info.subtitles;
+    if (!opts.some((o) => o.value === state.subs)) state.subs = "";
+    const manual = opts.filter((o) => !o.auto), auto = opts.filter((o) => o.auto);
+    const option = (o) => `<option value="${esc(o.value)}" ${o.value === state.subs ? "selected" : ""}>${esc(o.label)}</option>`;
+    const keep = state.settings ? state.settings.keep_subtitle_file : true;
+    return `
+      <div class="sub-pick">
+        <label for="subSel">${ICON.cc}<span>Subtitles</span></label>
+        <select id="subSel">
+          <option value="">None</option>
+          ${manual.length ? `<optgroup label="Subtitles">${manual.map(option).join("")}</optgroup>` : ""}
+          ${auto.length ? `<optgroup label="Auto-generated">${auto.map(option).join("")}</optgroup>` : ""}
+        </select>
+      </div>
+      <p class="hint sub-hint ${state.subs ? "" : "hidden"}" id="subHint">
+        Embedded in the video${keep ? " and saved as a separate .srt file" : ""}.
+        ${info.type === "playlist" ? "Videos without them are saved without subtitles." : ""}
+      </p>`;
+  }
+
   function bindPreviewControls(info, rerender) {
+    const subSel = $("#subSel", preview);
+    if (subSel) subSel.addEventListener("change", () => {
+      state.subs = subSel.value;
+      $("#subHint", preview).classList.toggle("hidden", !state.subs);
+    });
     $$("#kindSeg button", preview).forEach((b) => b.addEventListener("click", () => {
       if (state.kind === b.dataset.kind) return;
       state.kind = b.dataset.kind;
@@ -273,6 +303,7 @@
           ${info.is_live ? `<p class="hint" style="color:var(--warn);margin:-8px 0 14px">This is a live stream. It will download from the current point.</p>` : ""}
           ${kindToggle()}
           ${qualityGrid(info)}
+          ${subtitlePicker(info)}
           <button class="btn btn-primary btn-block" id="dlBtn">${ICON.download}<span>Download</span></button>
         </div>
       </div>`;
@@ -317,6 +348,7 @@
           </div>
           ${kindToggle()}
           ${qualityGrid(info)}
+          ${subtitlePicker(info)}
           <button class="btn btn-primary btn-block" id="dlBtn">${ICON.download}<span id="dlLabel">Download</span></button>
         </div>
       </div>`;
@@ -343,7 +375,13 @@
     const btn = $("#dlBtn");
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span><span>Adding…</span>'; }
     try {
-      const { data } = await api("/api/download", { body: { items, kind: state.kind, quality: state.quality } });
+      const body = { items, kind: state.kind, quality: state.quality };
+      if (state.kind === "video" && state.subs) {
+        const opt = (state.info?.subtitles || []).find((o) => o.value === state.subs);
+        body.subtitles = state.subs;
+        body.subtitles_label = opt ? opt.label : state.subs;
+      }
+      const { data } = await api("/api/download", { body });
       toast(data.length === 1 ? "Added to downloads" : `${data.length} videos added to downloads`, "ok");
       preview.classList.add("hidden");
       preview.innerHTML = "";
@@ -433,6 +471,7 @@
         <div class="bar"><i></i></div>
         <div class="job-stats"><span class="stage"></span><span class="nums"></span></div>
         <div class="job-error hidden"></div>
+        <div class="job-notice hidden"></div>
       </div>
       <div class="job-actions"></div>`;
     el.addEventListener("click", (e) => {
@@ -460,7 +499,8 @@
     const pill = $(".pill", el);
     pill.className = `pill s-${job.status}`;
     pill.textContent = STATUS_LABEL[job.status] || job.status;
-    $(".q", el).textContent = job.quality_label || "";
+    $(".q", el).textContent = [job.quality_label, job.subtitles_label && `CC ${job.subtitles_label}`]
+      .filter(Boolean).join(" · ");
     $(".who", el).textContent = job.status === "done" ? fmtAgo(job.finished_at) : (job.uploader || "");
 
     const bar = $(".bar", el);
@@ -496,6 +536,11 @@
     const showErr = job.error && (job.status === "error" || job.status === "waiting");
     err.classList.toggle("hidden", !showErr);
     if (showErr) err.textContent = job.error;
+
+    const notice = $(".job-notice", el);
+    const showNotice = job.notice && job.status === "done";
+    notice.classList.toggle("hidden", !showNotice);
+    if (showNotice) notice.textContent = job.notice;
 
     const actions = [];
     if (job.status === "done") {
@@ -659,6 +704,7 @@
     $("#optH264").checked = !!s.prefer_h264;
     $("#optThumb").checked = !!s.embed_thumbnail;
     $("#optMeta").checked = !!s.add_metadata;
+    $("#optSubFile").checked = !!s.keep_subtitle_file;
     if (s.theme && !store.get("cv-theme")) applyTheme(s.theme);
   }
 
@@ -694,6 +740,7 @@
   $("#optH264").addEventListener("change", (e) => saveSettings({ prefer_h264: e.target.checked }));
   $("#optThumb").addEventListener("change", (e) => saveSettings({ embed_thumbnail: e.target.checked }));
   $("#optMeta").addEventListener("change", (e) => saveSettings({ add_metadata: e.target.checked }));
+  $("#optSubFile").addEventListener("change", (e) => saveSettings({ keep_subtitle_file: e.target.checked }));
 
   $("#updateBtn").addEventListener("click", async () => {
     try {
